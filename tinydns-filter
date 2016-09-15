@@ -1,0 +1,1377 @@
+#!/usr/bin/env perl
+
+# =============================================================================
+# Copyright (c) 2016, Weebly, Inc, All Rights Reserved
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of Weebly nor the names of its contributors may be used to
+#    endorse or promote products derived from this software without specific
+#    prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL Weebly, Inc BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# =============================================================================
+
+use warnings;
+use strict;
+
+# -----------------------------------------------------------------------------
+
+our $NAME = 'tinydns-filter';
+our $VERSION = '1.0.4';
+our $COPYRIGHT = '2016';
+our $OWNER = 'Weebly, Inc';
+our $AUTHOR = 'Jeff Walter <jwalter@weebly.com>';
+our @CONTRIBUTORS = ();
+
+# -----------------------------------------------------------------------------
+
+our (%OPTIONS, @rrTypes, @lines);
+
+# Start with two passes
+@rrTypes = ({}, {});
+
+# =============================================================================
+# Output functions
+
+our $__INDENT = 0;
+sub pindent {
+	$__INDENT++;
+}
+sub poutdent {
+	my $count = shift || 1;
+
+	$__INDENT -= $count;
+	if ($__INDENT < 0) {
+		$__INDENT = 0;
+	}
+}
+sub pinfo {
+	my ($format, @args) = @_;
+
+	printf (STDERR ('  ' x $__INDENT) . ' * ' . $format . "\n", @args);
+}
+sub pnotice {
+	my ($format, @args) = @_;
+
+	printf (STDERR ('  ' x $__INDENT) . ' ^ ' . $format . "\n", @args);
+}
+sub pwarn {
+	my ($format, @args) = @_;
+
+	printf (STDERR ('  ' x $__INDENT) . ' # ' . $format . "\n", @args);
+}
+sub perror {
+	my ($format, @args) = @_;
+
+	printf (STDERR ('  ' x $__INDENT) . ' ! ' . $format . "\n", @args);
+}
+sub pfatal {
+	my ($exit, $format, @args) = @_;
+
+	perror ($format, @args);
+	exit ($exit || 1);
+}
+
+# =============================================================================
+# Script information functions
+
+sub showHelp {
+	my ($exitCode) = (@_);
+	my (@types, $type, $pass, $contributor, $line);
+
+	# Check for an exit code
+	if (! defined ($exitCode)) {
+		# None, default to 0
+		$exitCode = 0;
+	}
+
+	printf (<<'EOF', $NAME, $VERSION, $COPYRIGHT, $OWNER, $AUTHOR);
+%s version %s
+Copyright (C) %s %s, All Rights Reserved
+Written by %s
+<https://github.com/weebly/tinydns-filter>
+
+tinydns-filter comes with ABSOLUTELY NO WARRANTY, expressed or implied. This
+is, after all, :freesoftware:.
+
+Contributors:
+EOF
+
+	# Check for contributors
+	if (scalar (@CONTRIBUTORS) == 0) {
+		# Aww, none yet
+		printf ("  None\n");
+
+	} else {
+		# Contributors! Clear the line
+		$line = '  ';
+		# Loop through each one
+		foreach $contributor (@CONTRIBUTORS) {
+			# Check for enought room on the line
+			if (length (sprintf ('%s%s,', $line, $contributor)) > 80) {
+				# Too long. Trim the trailing space
+				$line =~ s/\s+$//;
+				# Print the currently built line
+				printf ("%s\n", $line);
+				# Reset the line
+				$line = '  ';
+			}
+
+			# Append to the line
+			$line .= sprintf ('%s, ', $contributor);
+		}
+		# Trim off the trailing comma
+		$line =~ s/,\s*$//;
+		# Print the line
+		printf ("%s\n", $line);
+	}
+
+	printf (<<'EOF', $NAME, $NAME, $NAME, $NAME, $NAME, $NAME, $NAME, $NAME, $NAME);
+
+Usage: ... | %s [OPTIONS] | ...
+  or   ... | %s [OPTIONS] -o <FILE>
+  or   ... | %s [OPTIONS] > <FILE>
+  or   %s [OPTIONS] -i <FILE> | ...
+  or   %s [OPTIONS] -i <FILE> -o <FILE>
+  or   %s [OPTIONS] -i <FILE> > <FILE>
+  or   %s [OPTIONS] < <FILE> | ...
+  or   %s [OPTIONS] < <FILE> -o <FILE>
+  or   %s [OPTIONS] < <FILE> > <FILE>
+
+File specification:
+  -i, --in   FILE,-       Specifies the file to read from. Default '-' means
+                          STDIN.
+  -o, --out  FILE,-       Specifies the file to write to. Default '-' means
+                          STDOUT.
+
+Options:
+  -h, --help              Shows this help.
+  -V, --version           Shows version information.
+  -b, --noblanklines      Removes empty lines or lines containing just
+                          whitespace from the output.
+  -c, --nocomments        Removes comments from the output.
+
+  -a, --alias-fail  MODE  Sets the failure mode for ALIAS records. Can be
+                          'exit' (default), 'drop', or 'cname'.
+
+EOF
+
+	# Go through each pass of handled records
+	for ($pass = 0; $pass <= $#rrTypes; $pass++) {
+		# Note the pass
+		printf ("Handled Records (pass %u):\n", $pass + 1);
+		# Gather the record type characters from the pass
+		@types = keys (%{$rrTypes [$pass]});
+		# Sort the record type characters by the actual type
+		@types = sort {$rrTypes [$pass]->{$a}->{'type'} cmp $rrTypes [$pass]->{$b}->{'type'}} (@types);
+		# Loop through the record type characters for the pass
+		foreach $type (@types) {
+			# Output the actual record type followed by the line format
+			printf ("  %-9s %s%s[:[TTL][:[TIMESTAMP][:[LOCATION]]]]\n", $rrTypes [$pass]->{$type}->{'type'} . ':', $type, $rrTypes [$pass]->{$type}->{'format'});
+		}
+		# Extra padding
+		print ("\n");
+	}
+
+	printf (<<'EOF');
+Standard Records:
+  SOA+NS+A: .<FQDN>:[IPV4]:<X>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  NS+A:     &<FQDN>:<IPV4>:<X>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  A+PTR:    =<FQDN>:<IPV4>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  A:        +<FQDN>:<IPV4>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  MX+A:     @<FQDN>:[IPV4]:<X>:<DISTANCE>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  PTR:      ^<FQDN>:<TARGET_HOSTNAME>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  CNAME:    C<FQDN>:<TARGET_HOSTNAME>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+  SOA:      Z<FQDN>:<PRIMARY_NS>:<CONTACT>[:[SERIAL][:[REFRESH][:[RETRY][:[EXPIRE][:[MINIMUM][:[TTL][:[TIMESTAMP][:[LOCATION]]]]]]]]]
+
+Generic Records:
+  :<FQDN>:<TYPE>:<RDATA>[:[TTL][:[TIMESTAMP][:[LOCATION]]]]
+
+Locations:
+  %%<LOCATION>[:<IP_PREFIX>]
+
+EOF
+
+	# All done
+	exit ($exitCode);
+}
+
+sub showVersion {
+	my ($exitCode) = (@_);
+
+	# Check for an exit code
+	if (! defined ($exitCode)) {
+		# None, default to 0
+		$exitCode = 0;
+	}
+
+	printf (<<EOF, $NAME, $VERSION);
+%s version %s
+
+EOF
+
+	# All done
+	exit ($exitCode);
+}
+
+# =============================================================================
+# Library functions
+
+# -----------------------------------------------------------------------------
+# Encoding and decoding functions for tinydns
+
+sub tinydns_encode {
+	my ($data, $all) = @_;
+
+	# Are we encoding everything?
+	if ($all) {
+		# Octal-encode the whole thing
+		$data =~ s/(.)/'\\'.sprintf('%03o',ord($1))/esmgi;
+	} else {
+		# Replace everything that is not a valid hostname character with an octal-encoded version
+		$data =~ s/([^a-z0-9_.-])/'\\'.sprintf('%03o',ord($1))/esmgi;
+	}
+
+	# Return the encoded string
+	return ($data);
+}
+
+sub tinydns_decode {
+	my ($data) = @_;
+
+	# Undo octal encoding using regex magic
+	$data =~ s/(?<!\\)\\(\d{3})/chr(oct($1))/esmg;
+
+	# Return the raw string
+	return ($data);
+}
+
+sub tinydns_ttl {
+	my ($ttl, $timestamp, $location) = @_;
+	my ($return);
+
+	# Start with a TTL
+	$return = sprintf (':%s', ($ttl || ''));
+	# Add a timestamp
+	$return .= sprintf (':%s', ($timestamp || ''));
+	# And tack on a location
+	$return .= sprintf (':%s', ($location || ''));
+
+	# Now strip off all the trailing colons (cound be all of them)
+	$return =~ s/:+$//;
+
+	# Return!!!
+	return ($return);
+}
+
+sub dns_is_hostname_valid {
+	my ($hostname) = @_;
+
+	# Strip off any trailing dot
+	$hostname =~ s/\.$//;
+
+	# Check for valid labels: character makeup and length
+	if ($hostname !~ /^(?:_?(?:[a-z0-9]{1,2}|[a-z0-9][a-z0-9-]{1,61}[a-z0-9])\.)*_?(?:[a-z0-9]{1,2}|[a-z0-9][a-z0-9-]{1,61}[a-z0-9])$/i) {
+		return (0);
+	}
+
+	# Check overall name length (253 plus the implied . at the end)
+	if (length ($hostname) > 253) {
+		# EXTERMINATE
+		return (0);
+	}
+
+	# Good to go
+	return (1);
+}
+
+sub dns_hostname_encode {
+	my ($hostname) = @_;
+
+	# First check that the hostname is valid
+	if (! dns_is_hostname_valid) {
+		# Oh, well, guess I'll be leaving
+		return (undef);
+	}
+
+	# Strip off any trailing dot
+	$hostname =~ s/\.$//;
+	# Split the hostname on dots into labels, prepend the length of each label
+	# to itself as an unsigned char, then join them all together
+	$hostname = join ('', map {pack ('CA*', length ($_), $_);} (split (/\./, $hostname), ''));
+
+	# And return something that we can send on the wire
+	return ($hostname);
+}
+
+# -----------------------------------------------------------------------------
+# Address conversion functions
+
+# Convert a presentation format IPv4 address to a packed form
+sub inet4_pton {
+	my ($addr) = @_;
+
+	# We could do this in multiple steps, but no, let's cheese it with a regex
+	if ($addr !~ /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d{1,2})\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d{1,2})$/) {
+		# Would seem this is not an IPv4 address
+		return (undef);
+	}
+
+	# Split'n'pack
+	return (pack ('C4', split (/\./, $addr)));
+}
+
+# Convert a packed IPv4 address to its presentation format
+sub inet4_ntop {
+	my ($addr) = @_;
+
+	# Check for valid length
+	if (length ($addr) != 4) {
+		# Beep wrong
+		return (undef);
+	}
+
+	# In one go
+	return (join ('.', unpack ('C4', $addr)));
+}
+
+# Convert a presentation format IPv4 CIDR to a packed network address
+sub inet4_pcton {
+	my ($addr, $length) = @_;
+	my ($network);
+
+	# Check for an integrated CIDR length
+	if (! defined ($length) && ($addr =~ /\//)) {
+		# Break the CIDR apart
+		($addr, $length) = split (/\//, $addr);
+	}
+
+	# Convert the address to a packed form
+	$addr = inet4_pton ($addr);
+	# Make sure it was valid
+	if (! defined ($addr)) {
+		# Welcome aboard the fail-boat
+		return (undef);
+	}
+
+	# Check the CIDR length
+	if (($length < 0) || ($length > 32)) {
+		# Negative or too long
+		return (undef);
+	}
+
+	# Build the network mask one byte or less at a time
+	for (; $length > 0; $length -= 8) {
+		# Whole byte or partial?
+		if ($length >= 8) {
+			# Whole
+			$network .= pack ('C', 0xff);
+		} else {
+			# Partial
+			$network .= pack ('B8', ('1' x $length) . ('0' x (8 - $length)));
+		}
+	}
+
+	# Apply the network mask
+	return ($addr & $network);
+}
+
+# Convert a presentation format IPv4 CIDR to a packed broadcast address
+sub inet4_pctob {
+	my ($addr, $length) = @_;
+	my ($network, $broadcast);
+
+	# Check for an integrated CIDR length
+	if (! defined ($length) && ($addr =~ /\//)) {
+		# Break the CIDR apart
+		($addr, $length) = split (/\//, $addr);
+	}
+
+	# First get the network address
+	$network = inet4_pcton ($addr, $length);
+	# Good?
+	if (! defined ($network)) {
+		# No so good
+		return (undef);
+	}
+
+	# Invert the length
+	$length = 32 - $length;
+
+	# Build the broadcast bits one byte or less at a time
+	for (; $length > 0; $length -= 8) {
+		# Whole or partial byte?
+		if ($length >= 8) {
+			# Whole byte
+			$broadcast = pack ('C', 0xff) . $broadcast;
+		} else {
+			# Not whole
+			$broadcast = pack ('B8', ('0' x (8 - $length)) . ('1' x $length)) . $broadcast;
+		}
+	}
+
+	# Apply the broadcast bits
+	return ($network | $broadcast);
+}
+
+# Convert a presentation format IPv4 to its reverse DNS hostname
+sub inet4_ptor {
+	my ($addr, $length, $style) = @_;
+	my (@addr, $network, $broadcast);
+
+	# Check for an integrated CIDR length
+	if (! defined ($length) && ($addr =~ /\//)) {
+		# Break the apart
+		($addr, $length) = split (/\//, $addr);
+	}
+
+	# If the length is specified it must be 0-32
+	if (defined ($length) && ($length !~ /^(?:3[0-2]|[0-2]?\d)$/)) {
+		# Whump whump
+		return (undef);
+	}
+
+	# Check for a valid address
+	if (! defined (inet4_pton ($addr))) {
+		# Invalid
+		return (undef);
+	}
+
+	# Break up the address
+	@addr = split (/\./, $addr);
+
+	# Default style, ignore length
+	if (! defined ($style) || ($length < 24)) {
+		# D.C.B.A.in-addr.arpa
+		return (sprintf ('%d.%d.%d.%d.in-addr.arpa', reverse (@addr)));
+
+	# DeGroot style
+	} elsif ($style eq 'degroot') {
+		# Get the network address
+		$network = inet4_pcton ($addr, $length);
+		# Check that it worked
+		if (! defined ($network)) {
+			# Negative
+			return (undef);
+		}
+		# Trim down to only the last octet
+		$network = unpack ('x3 C', $network);
+
+		# D.subnetNET.C.B.A.in-addr.arpa
+		return (sprintf ('%d.subnet%d.%d.%d.%d.in-addr.arpa', $addr [3], $network, reverse (@addr [0..2])));
+
+	# RFC4183 style
+	} elsif ($style eq '4183') {
+		# Get the network address
+		$network = inet4_pcton ($addr, $length);
+		# Check that it worked
+		if (! defined ($network)) {
+			# Negative
+			return (undef);
+		}
+		# Trim down to only the last octet
+		$network = unpack ('x3 C', $network);
+
+		# D.NET-CIDR.C.B.A.in-addr.arpa
+		return (sprintf ('%d.subnet%d-%d.%d.%d.%d.in-addr.arpa', $addr [3], $network, $length, reverse (@addr [0..2])));
+
+	# RFC2317 style
+	} elsif ($style eq '2317') {
+		# Get the network address
+		$network = inet4_pcton ($addr, $length);
+		# Check that it worked
+		if (! defined ($network)) {
+			# Negative
+			return (undef);
+		}
+		# Trim down to only the last octet
+		$network = unpack ('x3 C', $network);
+
+		# Get the broadcast address
+		$broadcast = inet4_pcton ($addr, $length);
+		# Check that it worked
+		if (! defined ($broadcast)) {
+			# Negative
+			return (undef);
+		}
+		# Trim down to only the last octet
+		$broadcast = unpack ('x3 C', $broadcast);
+
+		# D.NET-BCAST.C.B.A.in-addr.arpa
+		return (sprintf ('%d.subnet%d.%d.%d.%d.in-addr.arpa', $addr [3], $network, $broadcast, reverse (@addr [0..2])));
+
+	# Don't know that style
+	} else {
+		# Bye bye
+		return (undef);
+	}
+}
+
+# Convert a presentation-format IPv6 address to a network-ordered byte string
+sub inet6_pton {
+	my ($addr) = @_;
+	my (@bytes, $quad, $index, $indexSaved, $stopped);
+
+	# Where the datas go
+	@bytes = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	# If we've hit a double-colon
+	$stopped = 0;
+
+	# Check for incorrect colon arrangements
+	if ($addr =~ /(:{3,}|::.*::)/) {
+		# That's not right
+		return (undef);
+	}
+
+	# Where we're at
+	$index = 0;
+	# Go through each quad left to right
+	foreach $quad (split (/:/, $addr, 8)) {
+		# An empty quad is a double-colon
+		if (! length ($quad)) {
+			# Mark that we hit it
+			$stopped = 1;
+			# Abandon left-to-right parsing
+			last;
+
+		# Check for invalid data in the quad
+		} elsif ($quad !~ /^[0-9a-f]{1,4}$/) {
+			# Yeah, someone failed
+			return (undef);
+		}
+
+		# Store the top half of the quad
+		$bytes [2 * $index] = (hex ($quad) >> 8) & 0xff;
+		# Store the bottom half
+		$bytes [2 * $index + 1] = hex ($quad) & 0xff;
+		# Advance the index
+		$index++;
+	}
+
+	# Did we hit a double-colon?
+	if ($stopped) {
+		# Yarp! Save the previous index
+		$indexSaved = $index;
+		# Set the index to 7 since we're working right-to-left this time
+		$index = 7;
+		# Go through each quad right to left
+		foreach $quad (reverse (split (/:/, $addr, 8))) {
+			# An empty quad is a double-colon
+			if (! length ($quad)) {
+				# We're safe because we already know there's only one
+				# double-colon from the regex check on the address
+				last;
+
+			# Check for invalid data in the quad
+			} elsif ($quad !~ /^[0-9a-f]{1,4}$/) {
+				# And would you look at that...
+				return (undef);
+			}
+
+			# Store the top half of the quad
+			$bytes [2 * $index] = (hex ($quad) >> 8) & 0xff;
+			# Store the bottom half
+			$bytes [2 * $index + 1] = hex ($quad) & 0xff;
+			# Decrement the index
+			$index--;
+		}
+
+	# No, so check that we got 8 quads
+	} elsif ($index != 8) {
+		# F-ail
+		return (undef);
+	}
+
+	# Pack the bytes into a string
+	return (pack ('C16', @bytes));
+}
+
+# Convert a packed IPv6 address to its shortest presentation format
+sub inet6_ntop {
+	my ($addr) = @_;
+	my ($length);
+
+	# Check for valid length
+	if (length ($addr) != 16) {
+		# You lose
+		return (undef);
+	}
+
+	# Render the address
+	$addr = join (':', map {sprintf ('%x', $_);} (unpack ('n8')));
+
+	# Remove the first longest string of 0's
+	for ($length = 8; $length > 0; $length--) {
+		# Did we remove anything?
+		if ($addr =~ s/(?:(?:^|:)0){$length}/:/) {
+			# Cool, longest string of zeros is gone
+			last;
+		}
+	}
+
+	# Fix tailing colons
+	if (($addr =~ /:$/) && ($addr !~ /::/)) {
+		$addr .= ':';
+	}
+
+	# Done
+	return ($addr);
+}
+
+# Convert a presentation-format IPv6 address to its reverse DNS hostname
+sub inet6_ptor {
+	my ($addr) = @_;
+	my (@nibbles, $byte);
+
+	# Convert the address to a packed form
+	$addr =  inet6_pton ($addr);
+	# Valid?
+	if (! defined ($addr)) {
+		# No so much
+		return (undef);
+	}
+
+	# Loop through each unsigned 8-bit integer in the packed address
+	foreach $byte (unpack ('C16', $addr)) {
+		# Store the top nibble
+		push (@nibbles, sprintf ('%x', ($byte & 0xf0) >> 4));
+		# And the bottom
+		push (@nibbles, sprintf ('%x', ($byte & 0x0f)));
+	}
+
+	# Concatenate all the nibbles (reversed) with periods and append the SLD and TLD
+	return (join ('.', reverse (@nibbles)) . '.ip6.arpa');
+}
+
+# =============================================================================
+
+sub readData {
+	my ($line, @line, $lines);
+
+	# Is the input file defined?
+	if (! defined ($OPTIONS {'inFile'})) {
+		# No, so we re-open STDIN as INPUT
+		if (! open (INPUT, '<&', \*STDIN)) {
+			# This should never happen
+			pfatal (1, 'Failed to open STDIN for input: %s', $!);
+			exit (1);
+		}
+
+	} else {
+		# Yup, try to open it
+		if (! open (INPUT, '<', $OPTIONS {'inFile'})) {
+			# This could totally happen
+			pfatal (1, 'Failed to open input file: %s', $!);
+			exit (1);
+		}
+	}
+
+	# Set the number of lines read to zero
+	$lines = 0;
+	# Loop through INPUT on line at a time
+	while ($line = <INPUT>) {
+		# Remove leading spaces
+		$line =~ s/^\s+//;
+		# Remove trailing spaces (includes new-lines)
+		$line =~ s/\s+$//sm;
+
+		# Is it a record or something else?
+		if ($line =~ /^(?:#.*)?$/) {
+			# Looks like a comment or a blank line. Push it onto the array
+			push (@lines, $line);
+
+		} else {
+			# MUST be a record. Split in two: first with the type and
+			# FQDN/label, second with everything else
+			@line = split (/:/, $line, 2);
+			# Push three things onto the array as an array:
+			push (@lines, [
+				# The type
+				substr ($line, 0, 1),
+				# The FQDN/label
+				substr ($line [0], 1),
+				# The line minus the type
+				substr ($line, 1)
+			]);
+		}
+		# Increment the lines read
+		$lines++;
+	}
+	# Close the input file/dup of STDIN
+	close (INPUT);
+
+	# Return the number of lines read
+	return ($lines);
+}
+
+sub writeData {
+	my ($line, $lines);
+
+	# Is the output file defined?
+	if (! defined ($OPTIONS {'outFile'})) {
+		# No, so it's supposed to be STDOUT, re-open that
+		if (! open (OUTPUT, '>&', \*STDOUT)) {
+			# How I ask you?
+			pfatal (1, 'Failed to open STDOUT for output: %s', $!);
+			exit (1);
+		}
+	} else {
+		# It's a file! Open it!
+		if (! open (OUTPUT, '<', $OPTIONS {'outFile'})) {
+			# Shucks
+			pfatal (1, 'Failed to open output file: %s', $!);
+			exit (1);
+		}
+	}
+
+	# Set the number of lines written to zero
+	$lines = 0;
+	# Go through each line
+	foreach $line (@lines) {
+		# An ARRAY ref is a record, no ref is a comment or blank
+		if (ref ($line) eq 'ARRAY') {
+			# Record, combine the type with the line minus the type
+			printf (OUTPUT "%s%s\n", $line->[0], $line->[2]);
+		} else {
+			# Comment (like me!) or blank, just print
+			printf (OUTPUT "%s\n", $line);
+		}
+		# Increment the lines written counter
+		$lines++;
+	}
+	# Close the output file or dup of STDOUT
+	close (OUTPUT);
+
+	# Return the number of lines written
+	return ($lines);
+}
+
+# =============================================================================
+# Custom record builders
+
+# -----------------------------------------------------------------------------
+# AAAA and AAAA+PTR record (pass 1)
+
+$rrTypes [0]->{'A'} = {
+	'type' => 'AAAA',
+	'regex' => qr/([^:]+):"(.*?)(?<!\\)"/,
+	'format' => '<FQDN>:"<IPV6>"',
+	'call' => \&buildAAAA,
+	'args' => [0]
+};
+$rrTypes [0]->{'V'} = {
+	'type' => 'AAAA+PTR',
+	'regex' => qr/([^:]+):"(.*?)(?<!\\)"/,
+	'format' => '<FQDN>:"<IPV6>"',
+	'call' => \&buildAAAA,
+	'args' => [1]
+};
+sub buildAAAA {
+	my ($ptr, $lineno, $line, $fqdn, $addr, $ttl, $timestamp, $location) = @_;
+	my (@return, $paddr, $raddr);
+
+	# We'll let tinydns-data decide whether or not the FQDN is valid,
+	# but we have to decide if the IPv6 address is valid. So, attempt
+	# to encode it.
+	$paddr = inet6_pton ($addr);
+	if (! defined ($paddr)) {
+		# Hawkward
+		pfatal (1, 'IPv6 address %s is not valid at line %u', $addr, $lineno);
+	}
+
+	# Add the AAAA to the return
+	push (@return, [
+		':',
+		$fqdn,
+		sprintf ('%s:28:%s%s', $fqdn, tinydns_encode ($paddr, 1), tinydns_ttl ($ttl, $timestamp, $location))
+	]);
+
+	# Do we need to add a PTR?
+	if ($ptr == 1) {
+		# Sure do, construct the reverse name
+		$raddr = inet6_ptor ($addr);
+		# This should never happen because we'd have failed above, but just in
+		# case let's check again
+		if (! defined ($raddr)) {
+			# Uh, bug?
+			pfatal (1, 'IPv6 address %s is not valid at line %u', $addr, $lineno);
+		}
+		# Add the PTR to the return
+		push (@return, [
+			'^',
+			$fqdn,
+			sprintf ('%s:%s%s', $raddr, $fqdn, tinydns_ttl ($ttl, $timestamp, $location))
+		]);
+	}
+
+	# Return all of the records we built
+	return (@return);
+}
+
+# -----------------------------------------------------------------------------
+# SRV record (pass 1)
+
+$rrTypes [0]->{'S'} = {
+	'type' => 'SRV',
+	'regex' => qr/([^:]+):(\d*):(\d*):(\d+):([^:]+)/,
+	'format' => '<FQDN>:<PRIORITY>:<WEIGHT>:<PORT>:<TARGET_HOSTNAME>',
+	'call' => \&buildSRV,
+	'args' => []
+};
+sub buildSRV {
+	my ($lineno, $line, $fqdn, $priority, $weight, $port, $target, $ttl, $timestamp, $location) = @_;
+
+	# Again, let tinydns-data decide if FQDN is valid, but warn if it
+	# does not appear to be formatted as an SRV name.
+	if ($fqdn !~ /^_(?:[a-z0-9]{1,2}|[a-z0-9][a-z0-9-]+[a-z0-9])\._(?:tcp|udp)\./i) {
+		pwarn ('SRV record %s does not appear to be well-formed (_<SERVICE>._<tcp|udp>...) at line %u: %s', $fqdn, $lineno, $line);
+	}
+
+	# Validate everything else. Start with whether or not priority is given
+	if (! defined ($priority)) {
+		# Default it
+		$priority = 0;
+	}
+	# Check that the priority will fit in an unsigned short integer
+	if (($priority < 0) || ($priority > 65535)) {
+		# Too big or too small, doesn't matter
+		pfatal (1, 'Invalid SRV record priority %u at line %u: %s', $priority, $lineno, $line);
+	}
+	# Is weight specified?
+	if (! defined ($weight)) {
+		# Nah, but we'll assume they meant zero
+		$weight = 0;
+	}
+	# Does weight fit in an unsigned short integer?
+	if (($weight < 0) || ($weight > 65535)) {
+		# Not the ideal weight
+		pfatal (1, 'Invalid SRV record weight %u at line %u: %s', $weight, $lineno, $line);
+	}
+	# Was the port specified?
+	if (! defined ($port)) {
+		# We won't default this
+		pfatal (1, 'SRV record missing port at line %u: %s', $lineno, $line);
+	}
+	# Is it a valid port?
+	if (($port <= 0) || ($port > 65535)) {
+		# Sure don't look like it
+		pfatal (1, 'Invalid SRV record port %u at line %u: %s', $port, $lineno, $line);
+	}
+	# Encode the target using the standard DNS label method
+	$target = dns_hostname_encode ($target);
+	# It was a valid hostname right?
+	if (! defined ($target)) {
+		# Wrong
+		pfatal (1, 'Invalid SRV record target hostname %s at line %u: %s', $target, $lineno, $line);
+	}
+
+	# Convert shorts to network byte order strings
+	$priority = pack ('n', $priority);
+	$weight = pack ('n', $weight);
+	$port = pack ('n', $port);
+
+	# Write it
+	return ([
+		':',
+		$fqdn,
+		sprintf ('%s:33:%s%s%s%s%s', $fqdn, tinydns_encode ($priority, 1), tinydns_encode ($weight, 1), tinydns_encode ($port, 1), tinydns_encode ($target), tinydns_ttl ($ttl, $timestamp, $location))
+	]);
+}
+
+# -----------------------------------------------------------------------------
+# TXT record (wrapper for better/flexible formatting) (pass 1)
+
+$rrTypes [0]->{"'"} = {
+	'type' => 'TXT',
+	'regex' => qr/([^:]+):(?:"(.*?)(?<!\\)"|[^:]*)/,
+	'format' => '<FQDN>:"<TEXT>"',
+	'call' => \&buildTXT,
+	'args' => []
+};
+sub buildTXT {
+	my ($lineno, $line, $fqdn, $text, $ttl, $timestamp, $location) = @_;
+
+	# Convert escaped characters to their raw form
+	# Double-quotes and double-backslashes are direct
+	$text =~ s/\\(\"|\\)/$1/;
+	# Lettered codes we'll cheat
+	$text =~ s/\\([a-wyz])/eval("\"\\$1\"");/eigms;
+	# Hex-encoded values
+	$text =~ s/\\x([0-9a-f])/chr(hex($1));/eigms;
+	# Oct-encoded values
+	$text =~ s/\\([0-3][0-7]{2})/chr(oct($1));/eigms;
+
+	# Check for a valid length
+	if (length ($text) > 255) {
+		# Appears to be too long
+		pfatal (1, 'Invalid SPF3 record data length at line %u: %s', $lineno, $line);
+	}
+
+	# Return it encoded
+	return ([
+		"'",
+		$fqdn,
+		sprintf ('%s:%s%s', $fqdn, tinydns_encode ($text), tinydns_ttl ($ttl, $timestamp, $location))
+	]);
+}
+
+# -----------------------------------------------------------------------------
+# Type 99 SPF record (deprecated but still used by some services) (pass 1)
+
+$rrTypes [0]->{'['} = {
+	'type' => 'SPF',
+	'regex' => qr/([^:]+):(?:"(.*?)(?<!\\)"|[^:]*)/,
+	'format' => '<FQDN>:"<SPF>"',
+	'call' => \&buildSPF,
+	'args' => []
+};
+sub buildSPF {
+	my ($lineno, $line, $fqdn, $text, $ttl, $timestamp, $location) = @_;
+
+	# Convert escaped characters to their raw form
+	# Double-quotes and double-backslashes are direct
+	$text =~ s/\\(\"|\\)/$1/;
+	# Lettered codes we'll cheat
+	$text =~ s/\\([a-wyz])/eval("\"\\$1\"");/eigms;
+	# Hex-encoded values
+	$text =~ s/\\x([0-9a-f])/chr(hex($1));/eigms;
+	# Oct-encoded values
+	$text =~ s/\\([0-3][0-7]{2})/chr(oct($1));/eigms;
+
+	# Check for a valid length
+	if (length ($text) > 255) {
+		# Appears to be too long
+		pfatal (1, 'Invalid SPF3 record data length at line %u: %s', $lineno, $line);
+	}
+
+	# Return it encoded
+	return ([
+		':',
+		$fqdn,
+		sprintf ('%s:99:\\%03o%s%s', $fqdn, length ($text), tinydns_encode ($text), tinydns_ttl ($ttl, $timestamp, $location))
+	]);
+}
+
+# -----------------------------------------------------------------------------
+# CAA (Certification Authority Authorization) record (pass 1)
+
+$rrTypes [0]->{'L'} = {
+	'type' => 'CAA',
+	'regex' => qr/([^:]+):([^:]*):([^:]+):"(.*?)(?<!\\)"/,
+	'format' => '<FQDN>:[FLAGS]:<TAG>:"<VALUE>"',
+	'call' => \&buildCAA,
+	'args' => []
+};
+sub buildCAA {
+	my ($lineno, $line, $fqdn, $flags, $tag, $value, $ttl, $timestamp, $location) = @_;
+	my ($recordlen);
+
+	# Check and parse the flags
+	if ($flags =~ /^crit(?:ical)?$/i) {
+		# Critical is a static
+		$flags = 0x80;
+	} elsif ($flags =~ /^0x[0-9a-f]+$/) {
+		# Hexadecimal flags, someone thinks they know what they're doing
+		$flags = hex ($flags);
+		# Do they really though?
+		if (($flags < 0) || ($flags > 255)) {
+			# Nope!
+			pfatal (1, 'Invalid flags for CAA record at line %u: %s', $lineno, $line);
+		}
+	} elsif ($flags =~ /^-?\d+$/) {
+		# Integer flags, brave
+		$flags = int ($flags);
+		# But are they right?
+		if (($flags < 0) || ($flags > 255)) {
+			# Negative ghostrider
+			pfatal (1, 'Invalid flags for CAA record at line %u: %s', $lineno, $line);
+		}
+	} elsif ($flags ne "") {
+		# I don't know what they passed, but it's not flags
+		pfatal (1, 'Invalid flags for CAA record at line %u: %s', $lineno, $line);
+	} else {
+		# Default to 0
+		$flags = 0;
+	}
+	# Check that the tag contains only valid characters
+	if (($tag !~ /^[a-z0-9]+$/i) || (length ($tag) > 255)) {
+		pfatal (1, 'Invalid tag for CAA record at line %u: %s', $lineno, $line);
+	}
+	# Make sure it's not too long
+	if (length ($tag) > 15) {
+		# Need to trim that down a bit
+		pwarn ('Tag exceeds recommended length (15) for CAA record at line %u: %s', $lineno, $line);
+	}
+	# Is it a well-known tag?
+	if ($tag !~ /^(issue|issuewild|iodef)$/i) {
+		# We won't fail on this, but we'll still complain
+		pwarn ('Non-standard tag for CAA record at line %u: %s', $lineno, $line);
+	}
+	# Check the length of the value
+	if (2 + length ($tag) + length ($value) > 65535) {
+		# Holy record length...
+		pfatal (1, 'Value for CAA record is too long at line %u: %s', $lineno, $line);
+	}
+
+	# Time to build the raw record
+	return ([
+		':',
+		$fqdn,
+		sprintf ('%s:257:\\%03o\\%03o%s%s%s', $fqdn, $flags, length ($tag), lc ($tag), tinydns_encode ($value), tinydns_ttl ($ttl, $timestamp, $location))
+	]);
+}
+
+# -----------------------------------------------------------------------------
+# ALIAS record (pass 2)
+
+$rrTypes [1]->{'H'} = {
+	'type' => 'ALIAS',
+	'regex' => qr/([^:]+):([^:]+)/,
+	'format' => '<FQDN>:<TARGET_HOSTNAME>',
+	'call' => \&buildALIAS,
+	'args' => []
+};
+sub buildALIAS {
+	my ($lineno, $line, $fqdn, $target, $ttl, $timestamp, $location) = @_;
+	my ($targetLine, $targetLineNo, @targetLines);
+
+	# First thing's first: find all the records for the target the hard way.
+	# Start by setting the target line number to zero
+	$targetLineNo = 0;
+	# Now search the lines for target records
+	TARGETLINE: foreach $targetLine (@lines) {
+		# Increment the target search line number
+		$targetLineNo++;
+
+		# Is this line an array ref with a matching FQDN?
+		if ((ref ($targetLine) eq 'ARRAY') && (lc ($targetLine->[1]) eq lc ($target))) {
+			# Cool, found one. It's not an ALIAS though... RIGHT?
+			if ($targetLine->[0] eq 'H') {
+				# Nope nope nope, we don't play that game (at least not yet).
+				# Fail according to the CLI option
+				if ($OPTIONS {'aliasFailMode'} eq 'e') {
+					pfatal (1, 'ALIAS record (line %u) target has an ALIAS record at line %u: %s%s', $lineno, $targetLineNo, $targetLine->[0], $targetLine->[2]);
+
+				} elsif ($OPTIONS {'aliasFailMode'} eq 'd') {
+					pwarn ('Dropping ALIAS record (line %u): Target has ALIAS record at line %u: %s%s', $lineno, $targetLineNo, $targetLine->[0], $targetLine->[2]);
+					return ();
+
+				} elsif ($OPTIONS {'aliasFailMode'} eq 'c') {
+					pwarn ('Converting ALIAS record (line %u) to CNAME: Target has ALIAS record at line %u: %s%s', $lineno, $targetLineNo, $targetLine->[0], $targetLine->[2]);
+					return ([
+						'C',
+						$fqdn,
+						sprintf ('%s:%s%s', $fqdn, $target, tinydns_ttl ($ttl, $timestamp, $location))
+					]);
+				}
+			}
+
+			push (@targetLines, [@{$targetLine}]);
+		}
+	}
+
+	# Did we find any records?
+	if (scalar (@targetLines) == 0) {
+		# None. How awkward. Interpret the ALIAS fail mode.
+		if ($OPTIONS {'aliasFailMode'} eq 'e') {
+			pfatal (1, 'ALIAS record at line %u has a non-existent target', $lineno);
+
+		} elsif (($OPTIONS {'aliasFailMode'} eq 'd') || ($OPTIONS {'aliasFailMode'} eq 'c')) {
+			pwarn ('Dropping ALIAS record at line %u: Target does not exist', $lineno);
+			return ();
+		}
+	}
+
+	# Change all of the target records' FQDNs to what we need
+	@targetLines = map { $_->[2] = $fqdn . substr ($_->[2], length ($_->[1])); $_->[1] = $fqdn; $_; } @targetLines;
+
+	# Return the new records
+	return (@targetLines);
+}
+
+# =============================================================================
+# Record processing
+
+sub processCustomRecords {
+	my ($pass, $line, $lineno, $rrType, $records);
+	my (@return, $return, @output);
+
+	for ($pass = 0; $pass <= $#rrTypes; $pass++) {
+		# Note the pass number
+		pinfo ('Pass %u/%u', $pass + 1, $#rrTypes + 1);
+		# Indent for record builder messages
+		pindent ();
+
+		# Reset the output
+		@output = ();
+
+		# Zero records to start
+		$records = 0;
+
+		# Loop through each line
+		for ($lineno = 0; $lineno <= $#lines; $lineno++) {
+			# This just makes things easier
+			$line = $lines [$lineno];
+
+			# Is this a plain line?
+			if (ref ($line) ne 'ARRAY') {
+				# Yes, pass it through
+				push (@output, $line);
+
+			} else {
+				# No, it's a record. Is it something that we're going to munge?
+				if (defined ($rrTypes [$pass]->{$line->[0]})) {
+					# Sure enough. Save the rrType for easier reference
+					$rrType = $rrTypes [$pass]->{$line->[0]};
+
+					# Increment that counter
+					$records++;
+
+					# Does the record data match the expected format?
+					if ($line->[2] !~ /^$rrType->{'regex'}(?::(\d{1,10})?(?::([0-9a-f]{16})?(?::([a-z]{1,2})?)?)?)?$/i) {
+						# Whump whump
+						perror ('Invalid format for %s record at input line %u: %s%s', $lineno + 1, $line->[0], $line->[2]);
+						pnotice ('Format is:');
+						pindent ();
+						pnotice ('%s%s[:[TTL][:[TIMESTAMP][:[LOCATION]]]]', $rrType->{'type'}, $rrType->{'format'});
+						poutdent ();
+						exit (1);
+					}
+
+					# Call the function to handle the line
+					@return = &{$rrType->{'call'}} (@{$rrType->{'args'}}, $lineno + 1, $line->[0] . $line->[2], $1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+					# Push the records onto the output
+					push (@output, @return);
+
+				} else {
+					# Pass the record through
+					push (@output, $line);
+				}
+			}
+		}
+
+		# Replace the lines with our output
+		@lines = @output;
+
+		# Output the number of records we processed this pass
+		pinfo ('%u record%s', $records, ($records == 1 ? '' : 's'));
+
+		# Remove a level of indention
+		poutdent ();
+	}
+}
+
+sub removeComments {
+	my ($linei, $lines);
+
+	# Number of lines removed starts at zero
+	$lines = 0;
+
+	# Going through each line by index so we can splice things out
+	for ($linei = 0, $lines = 0; $linei <= $#lines; $linei++) {
+		# Is it a plain line that starts with a #?
+		if ((ref ($lines [$linei]) eq '') && (substr ($lines [$linei], 0, 1) eq '#')) {
+			# Sure is! Splice it out
+			splice (@lines, $linei, 1);
+			# Decrement the line index so we'll read this index again since it
+			# will technically be the next line
+			$linei--;
+			# Increment the number of lines removed
+			$lines++;
+		}
+	}
+
+	# Return the number of lines removed
+	return ($lines);
+}
+
+sub removeEmptyLines {
+	my ($linei, $lines);
+
+	# Number of lines removed starts at zero
+	$lines = 0;
+
+	# Going through each line by index so we can splice things out
+	for ($linei = 0, $lines = 0; $linei <= $#lines; $linei++) {
+		# Is it a plain line that's blank?
+		if ((ref ($lines [$linei]) eq '') && ($lines [$linei] eq '')) {
+			# Sure is! Splice it out
+			splice (@lines, $linei, 1);
+			# Decrement the line index so we'll read this index again since it
+			# will technically be the next line
+			$linei--;
+			# Increment the number of lines removed
+			$lines++;
+		}
+	}
+
+	# Return the number of lines removed
+	return ($lines);
+}
+
+# =============================================================================
+# Argument handling
+
+# Store parsed arguments in this
+%OPTIONS = (
+	'help' => undef,
+	'version' => undef,
+	'omitBlankLines' => undef,
+	'omitComments' => undef,
+	'inFile' => undef,
+	'outFile' => undef,
+
+	'aliasFailMode' => 'e',
+);
+
+# -----------------------------------------------------------------------------
+# Argument parser
+
+# Process arguments
+while (defined ($ARGV [0])) {
+	# Help?
+	if ($ARGV [0] =~ /^(?:-h|--help)$/) {
+		$OPTIONS {'help'} = 1;
+
+	# Version?
+	} elsif ($ARGV [0] =~ /^(?:-V|--version)$/) {
+		$OPTIONS {'version'} = 1;
+
+	# Omit empty lines?
+	} elsif ($ARGV [0] =~ /^(?:-b|--noblanklines)$/) {
+		$OPTIONS {'omitBlankLines'} = 1;
+
+	# Omit comments?
+	} elsif ($ARGV [0] =~ /^(?:-c|--nocomments)$/) {
+		$OPTIONS {'omitComments'} = 1;
+
+	# Input file?
+	} elsif ($ARGV [0] =~ /^(?:-i|--in)$/) {
+		# We have that extra argument right?
+		if (! defined ($ARGV [1])) {
+			# Wrong!
+			pfatal (1, 'Input file option requires a valid parameter');
+		}
+		# Save the specified file name
+		$OPTIONS {'inFile'} = $ARGV [1];
+		# Special handling for "-"
+		if ($OPTIONS {'inFile'} eq '-') {
+			# Set it to undef
+			$OPTIONS {'inFile'} = undef;
+		}
+		# Extra shift for the argument parameter
+		shift (@ARGV);
+
+	# Output file?
+	} elsif ($ARGV [0] =~ /^(?:-o|--out)$/) {
+		# We have that extra argument right?
+		if (! defined ($ARGV [1])) {
+			# Wrong!
+			pfatal (1, 'Output file option requires a valid parameter');
+		}
+		# Save the specified file name
+		$OPTIONS {'outFile'} = $ARGV [1];
+		# Special handling for "-"
+		if ($OPTIONS {'outFile'} eq '-') {
+			# Set it to undef
+			$OPTIONS {'outFile'} = undef;
+		}
+		# Extra shift for the argument parameter
+		shift (@ARGV);
+
+	# ALIAS failure mode?
+	} elsif ($ARGV [0] =~ /^(?:-a|--alias-fail)$/) {
+		# We have that extra argument right?
+		if (! defined ($ARGV [1])) {
+			# Wrong!
+			pfatal (1, 'ALIAS fail mode option requires a valid parameter');
+		}
+
+		# Check for a valid argument
+		if ($ARGV [1] =~ /^(?:(e|d|c)|(exit|drop|cname))$/) {
+			# Cool, now store it
+			$OPTIONS {'aliasFailMode'} = (defined ($1) ? $1 : substr ($2, 0, 1));
+		} else {
+			# Uh oh, not good
+			pfatal (1, 'ALIAS fail mode option requires a valid parameter');
+		}
+		# Extra shift for the argument parameter
+		shift (@ARGV);
+
+	# Unknown?
+	} else {
+		pfatal (1, 'Unknown option: %s', $ARGV [0]);
+	}
+	# Shift to the next argument
+	shift (@ARGV);
+}
+
+# -----------------------------------------------------------------------------
+# Handle certain arguments before processing any data
+
+# Should we show help?
+if (defined ($OPTIONS {'help'})) {
+	# Do it
+	showHelp ($OPTIONS {'help'});
+
+# Maybe the version information?
+} elsif (defined ($OPTIONS {'version'})) {
+	# Rock on
+	showVersion ($OPTIONS {'version'});
+}
+
+# =============================================================================
+# Zhu Li, do the thing
+
+my ($count);
+
+pinfo ('Reading zone information');
+pindent ();
+$count = readData ();
+pinfo ('%u line%s', $count, ($count == 1 ? '' : 's'));
+poutdent ();
+
+pinfo ('Processing custom records');
+pindent ();
+$count = processCustomRecords ();
+poutdent ();
+
+if ($OPTIONS {'omitBlankLines'}) {
+	pinfo ('Removing blank lines');
+	pindent ();
+	$count = removeEmptyLines ();
+	pinfo ('%u line%s', $count, ($count == 1 ? '' : 's'));
+	poutdent ();
+}
+
+if ($OPTIONS {'omitComments'}) {
+	pinfo ('Removing comments');
+	pindent ();
+	$count = removeComments ();
+	pinfo ('%u comment%s', $count, ($count == 1 ? '' : 's'));
+	poutdent ();
+}
+
+pinfo ('Writing zone information');
+pindent ();
+$count = writeData ();
+pinfo ('%u line%s', $count, ($count == 1 ? '' : 's'));
+poutdent ();
