@@ -735,7 +735,7 @@ sub writeData {
 		}
 	} else {
 		# It's a file! Open it!
-		if (! open (OUTPUT, '<', $OPTIONS {'outFile'})) {
+		if (! open (OUTPUT, '>', $OPTIONS {'outFile'})) {
 			# Shucks
 			pfatal (1, 'Failed to open output file: %s', $!);
 			exit (1);
