@@ -35,7 +35,7 @@ use strict;
 # -----------------------------------------------------------------------------
 
 our $NAME = 'tinydns-filter';
-our $VERSION = '1.0.5';
+our $VERSION = '1.0.6';
 our $COPYRIGHT = '2016';
 our $OWNER = 'Weebly, Inc';
 our $AUTHOR = 'Jeff Walter <jwalter@weebly.com>';
@@ -901,7 +901,7 @@ sub buildSRV {
 
 $rrTypes [0]->{"'"} = {
 	'type' => 'TXT',
-	'regex' => qr/([^:]+):(?:"(.*?)(?<!\\)"|[^:]*)/,
+	'regex' => qr/([^:]+):("(?:.*?)(?<!\\)"|[^:]*)/,
 	'format' => '<FQDN>:"<TEXT>"',
 	'call' => \&buildTXT,
 	'args' => []
@@ -909,6 +909,8 @@ $rrTypes [0]->{"'"} = {
 sub buildTXT {
 	my ($lineno, $line, $fqdn, $text, $ttl, $timestamp, $location) = @_;
 
+	# First, remove double-quotes from the ends if both ends have double-quotes
+	$text =~ s/^"(.*)"$/$1/;
 	# Convert escaped characters to their raw form
 	# Double-quotes and double-backslashes are direct
 	$text =~ s/\\(\"|\\)/$1/;
@@ -938,7 +940,7 @@ sub buildTXT {
 
 $rrTypes [0]->{'['} = {
 	'type' => 'SPF',
-	'regex' => qr/([^:]+):(?:"(.*?)(?<!\\)"|[^:]*)/,
+	'regex' => qr/([^:]+):("(?:.*?)(?<!\\)"|[^:]*)/,
 	'format' => '<FQDN>:"<SPF>"',
 	'call' => \&buildSPF,
 	'args' => []
@@ -946,6 +948,8 @@ $rrTypes [0]->{'['} = {
 sub buildSPF {
 	my ($lineno, $line, $fqdn, $text, $ttl, $timestamp, $location) = @_;
 
+	# First, remove double-quotes from the ends if both ends have double-quotes
+	$text =~ s/^"(.*)"$/$1/;
 	# Convert escaped characters to their raw form
 	# Double-quotes and double-backslashes are direct
 	$text =~ s/\\(\"|\\)/$1/;
