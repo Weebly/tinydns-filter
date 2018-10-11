@@ -35,8 +35,8 @@ use strict;
 # -----------------------------------------------------------------------------
 
 our $NAME = 'tinydns-filter';
-our $VERSION = '1.0.6';
-our $COPYRIGHT = '2016';
+our $VERSION = '1.0.7';
+our $COPYRIGHT = '2018';
 our $OWNER = 'Weebly, Inc';
 our $AUTHOR = 'Jeff Walter <jwalter@weebly.com>';
 our @CONTRIBUTORS = ();
@@ -390,6 +390,8 @@ sub inet4_pcton {
 		}
 	}
 
+	$network .= ("\x00" x (length ($addr) - length ($network)));
+
 	# Apply the network mask
 	return ($addr & $network);
 }
@@ -397,7 +399,7 @@ sub inet4_pcton {
 # Convert a presentation format IPv4 CIDR to a packed broadcast address
 sub inet4_pctob {
 	my ($addr, $length) = @_;
-	my ($network, $broadcast);
+	my ($broadcast);
 
 	# Check for an integrated CIDR length
 	if (! defined ($length) && ($addr =~ /\//)) {
@@ -406,10 +408,16 @@ sub inet4_pctob {
 	}
 
 	# First get the network address
-	$network = inet4_pcton ($addr, $length);
+	$addr = inet4_pton ($addr);
 	# Good?
-	if (! defined ($network)) {
+	if (! defined ($addr)) {
 		# No so good
+		return (undef);
+	}
+
+	# Check the CIDR length
+	if (($length < 0) || ($length > 32)) {
+		# Negative or too long
 		return (undef);
 	}
 
@@ -417,19 +425,21 @@ sub inet4_pctob {
 	$length = 32 - $length;
 
 	# Build the broadcast bits one byte or less at a time
-	for (; $length > 0; $length -= 8) {
+	for ($broadcast = ''; $length > 0; $length -= 8) {
 		# Whole or partial byte?
 		if ($length >= 8) {
 			# Whole byte
-			$broadcast = pack ('C', 0xff) . $broadcast;
+			$broadcast = "\xff" . $broadcast;
 		} else {
 			# Not whole
 			$broadcast = pack ('B8', ('0' x (8 - $length)) . ('1' x $length)) . $broadcast;
 		}
 	}
 
+	$broadcast = ("\x00" x (length ($addr) - length ($broadcast))) . $broadcast;
+
 	# Apply the broadcast bits
-	return ($network | $broadcast);
+	return ($addr | $broadcast);
 }
 
 # Convert a presentation format IPv4 to its reverse DNS hostname
@@ -634,6 +644,95 @@ sub inet6_ntop {
 
 	# Done
 	return ($addr);
+}
+
+# Convert a presentation format IPv6 CIDR to a packed network address
+sub inet6_pcton {
+	my ($addr, $length) = @_;
+	my ($network);
+
+	# Check for an integrated CIDR length
+	if (! defined ($length) && ($addr =~ /\//)) {
+		# Break the CIDR apart
+		($addr, $length) = split (/\//, $addr);
+	}
+
+	# Convert the address to a packed form
+	$addr = inet6_pton ($addr);
+	# Make sure it was valid
+	if (! defined ($addr)) {
+		# Welcome aboard the fail-boat
+		return (undef);
+	}
+
+	# Check the CIDR length
+	if (($length < 0) || ($length > 128)) {
+		# Negative or too long
+		return (undef);
+	}
+
+	# Build the network mask one byte or less at a time
+	for (; $length > 0; $length -= 8) {
+		# Whole byte or partial?
+		if ($length >= 8) {
+			# Whole
+			$network .= pack ('C', 0xff);
+		} else {
+			# Partial
+			$network .= pack ('B8', ('1' x $length) . ('0' x (8 - $length)));
+		}
+	}
+
+	$network .= ("\x00" x (length ($addr) - length ($network)));
+
+	# Apply the network mask
+	return ($addr & $network);
+}
+
+# Convert a presentation format IPv6 CIDR to a packed broadcast address
+sub inet6_pctob {
+	my ($addr, $length) = @_;
+	my ($broadcast);
+
+	# Check for an integrated CIDR length
+	if (! defined ($length) && ($addr =~ /\//)) {
+		# Break the CIDR apart
+		($addr, $length) = split (/\//, $addr);
+	}
+
+	# First get the network address
+	$addr = inet6_pton ($addr);
+	# Good?
+	if (! defined ($addr)) {
+		# No so good
+		return (undef);
+	}
+
+	# Check the CIDR length
+	if (($length < 0) || ($length > 128)) {
+		# Negative or too long
+		return (undef);
+	}
+
+	# Invert the length
+	$length = 128 - $length;
+
+	# Build the broadcast bits one byte or less at a time
+	for ($broadcast = ''; $length > 0; $length -= 8) {
+		# Whole or partial byte?
+		if ($length >= 8) {
+			# Whole byte
+			$broadcast = pack ('C', 0xff) . $broadcast;
+		} else {
+			# Not whole
+			$broadcast = pack ('B8', ('0' x (8 - $length)) . ('1' x $length)) . $broadcast;
+		}
+	}
+
+	$broadcast = ("\x00" x (length ($addr) - length ($broadcast))) . $broadcast;
+
+	# Apply the broadcast bits
+	return ($addr | $broadcast);
 }
 
 # Convert a presentation-format IPv6 address to its reverse DNS hostname
